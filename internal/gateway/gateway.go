@@ -9576,7 +9576,13 @@ var cacheControlField = []byte("cache_control")
 // not refused with a 400 the old translation never gave (#3835). Every
 // other request is one bytes.Contains away from this, a scan next to the
 // parse of the same body.
-func parseTranslated(from, to provider.Protocol, body []byte, advised bool) (*Request, error) {
+func parseTranslated(p provider.Provider, from, to provider.Protocol, body []byte, advised bool) (*Request, error) {
+	if from == provider.Responses && p.PluginProvider() == "agy-cli" {
+		// AGY reads trailing tool results as live MCP continuations. A
+		// Responses search item would otherwise become a synthetic result
+		// whose ID does not belong to the live turn (searchRoundsBack).
+		body = withoutSearchCalls(body)
+	}
 	if from == provider.Anthropic && to == provider.Anthropic && bodyHasBytes(body, cacheControlField) {
 		if req, err := readAdvised(body, true, false, advised); err == nil {
 			return afterParse(from, body, req)
@@ -9603,7 +9609,7 @@ func (s *Server) translate(w http.ResponseWriter, r *http.Request, p provider.Pr
 	// Claude Code's advisor, run by magpie for a model whose upstream
 	// can't (advisor_serve.go)
 	advised := advisedHere(p, from, to, model, body, wiresOf(r.Context()))
-	request, err := parseTranslated(from, to, body, advised)
+	request, err := parseTranslated(p, from, to, body, advised)
 	if err != nil {
 		return writeError(w, from, 400, err.Error()), err.Error()
 	}
@@ -9616,7 +9622,7 @@ func (s *Server) translate(w http.ResponseWriter, r *http.Request, p provider.Pr
 		for _, t := range s.usable(p, model) {
 			if searchesFor(p, t, model, request) && !magpieSearches(r.Context(), p) {
 				if from == provider.Responses && (to == provider.Responses) != (t == provider.Responses) {
-					request, err = parseRequest(from, body, false, t == provider.Responses)
+					request, err = parseTranslated(p, from, t, body, advised)
 					if err != nil {
 						return writeError(w, from, 400, err.Error()), err.Error()
 					}

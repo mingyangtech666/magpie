@@ -6,10 +6,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/yetone/magpie/internal/claudeseal"
 	"github.com/yetone/magpie/internal/provider"
 )
 
@@ -209,6 +211,63 @@ func TestClaudeThinkingAroundMagpieSearchGoesBackAsWritten(t *testing.T) {
 		if strings.Join(shape, "|") != want {
 			t.Fatalf("stream=%t: sent %s, want %s\n%s", stream, strings.Join(shape, "|"), want, last)
 		}
+	}
+}
+
+func TestAGYResponsesSearchHistoryIsNotALiveResult(t *testing.T) {
+	sealed := claudeseal.Seal([]byte(`{"type":"thinking","thinking":"Look it up.","signature":"EqA-before-search"}`))
+	const searchID = "ws_6"
+	const liveID = "toolu_012345678901234567890123"
+	prefix := `{"model":"neon","input":[{"type":"message","role":"user","content":"What is the latest Go?"},` +
+		`{"type":"reasoning","encrypted_content":"` + sealed + `"},` +
+		`{"type":"web_search_call","id":"` + searchID + `","status":"completed","action":{"type":"search","query":"latest go"}},`
+	for _, tc := range []struct {
+		name, tail string
+		live       []string
+	}{
+		{"follow-up without synthesis", `{"type":"message","role":"user","content":"Continue"}`, nil},
+		{"genuine continuation", `{"type":"function_call","call_id":"` + liveID + `","name":"read","arguments":"{}"},` +
+			`{"type":"function_call_output","call_id":"` + liveID + `","output":"read result"}`, []string{liveID}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(prefix + tc.tail + `],"tools":[{"type":"web_search"},{"type":"function","name":"read","parameters":{"type":"object"}}]}`)
+			for _, p := range []provider.Provider{provider.PluginForTest("local-agy", "agy-cli"), provider.PluginForTest("agy-cli", "other-plugin")} {
+				req, err := parseTranslated(p, provider.Responses, provider.Anthropic, body, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				wire, err := buildFor(p, provider.Anthropic, req, "neon")
+				if err != nil {
+					t.Fatal(err)
+				}
+				var msg struct {
+					Messages []struct {
+						Content []aBlock `json:"content"`
+					} `json:"messages"`
+				}
+				if err := json.Unmarshal(wire, &msg); err != nil {
+					t.Fatal(err)
+				}
+				var calls, results []string
+				for _, m := range msg.Messages {
+					for _, b := range m.Content {
+						switch b.Type {
+						case "tool_use":
+							calls = append(calls, b.ID)
+						case "tool_result":
+							results = append(results, b.ToolUseID)
+						}
+					}
+				}
+				want := tc.live
+				if p.PluginProvider() != "agy-cli" {
+					want = append([]string{searchID}, want...)
+				}
+				if !slices.Equal(calls, want) || !slices.Equal(results, want) || !strings.Contains(string(wire), "EqA-before-search") {
+					t.Fatalf("%s: wanted call and result IDs %q with signed thinking: %s", p.PluginProvider(), want, wire)
+				}
+			}
+		})
 	}
 }
 

@@ -1935,6 +1935,15 @@ Discord; `TestClaudeThinkingAroundMagpieSearchGoesBackAsWritten`,
 `TestSearchWithoutClaudeThinkingStaysOut` in
 [`claude_search_round_test.go`](../../internal/gateway/claude_search_round_test.go)).
 
+For `agy-cli`, `parseTranslated` leaves the items out first
+(`withoutSearchCalls`). The plugin reads a result that trails the history as
+the answer to an MCP call it holds live, and a rebuilt `ws_…` result names a
+call it never made: while a turn was held, the next turn got 409 "no active
+MCP call matches these tool results" until the third try took the held turn
+back. A client tool call and its result in the same history still go
+through (`TestAGYResponsesSearchHistoryIsNotALiveResult` in
+[`claude_search_round_test.go`](../../internal/gateway/claude_search_round_test.go)).
+
 This lets a Responses client verify search execution and display source
 links without sending a separate Anthropic Messages request. Covered by
 the `TestResponsesSearch` tests in

@@ -9662,7 +9662,7 @@ func (s *Server) translate(w http.ResponseWriter, r *http.Request, p provider.Pr
 			// a Kimi Code plan's own searches stay on it
 			r = r.WithContext(searchingOn(r.Context(), p))
 		}
-		return s.searchReply(w, r, from, p.Name, request, u, ask, search)
+		return s.searchReply(w, r, from, p, request, u, ask, search)
 	}
 	if msg := unportableVideo(to, request); msg != "" {
 		// told, not left out for the model to answer the words alone (#6135)

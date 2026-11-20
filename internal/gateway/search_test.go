@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,147 @@ import (
 
 	"github.com/yetone/magpie/internal/provider"
 )
+
+func TestAGYSearchBudgetCompletesPendingRound(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		clientTools []Tool
+		staleCalls  int
+		other       bool
+	}{
+		{name: "search only"},
+		{name: "client tool with same name", clientTools: []Tool{{Name: "web_search"}}},
+		{name: "one stale search call", staleCalls: 1},
+		{name: "repeated stale search calls", staleCalls: 2},
+		{name: "other supplier", other: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fresh(t)
+			api := newSearchAPIs(t)
+			if err := provider.SetSearchAPI(api.api("tavily", "tvly-k")); err != nil {
+				t.Fatal(err)
+			}
+			plugin := "agy-cli"
+			if tc.other {
+				plugin = "other"
+			}
+			p := provider.PluginForTest("local-test", plugin)
+			const system = "Keep the answer concise."
+			const user = "Search for Go releases"
+			const synthesis = "Magpie's hosted web search budget is exhausted. Use the search findings already collected to answer the original request and cite the sources you rely on."
+			tool := searchTool(tc.clientTools).Name
+			id := func(n int) string { return fmt.Sprintf("toolu_%024x", n) }
+			n := 0
+			ask := func(_ context.Context, req *Request) (<-chan Event, int, string) {
+				n++
+				wire := anthropicBody(req, "neon", "", false)
+				sent, err := parse(provider.Anthropic, wire)
+				if err != nil {
+					t.Errorf("round %d: %v", n, err)
+					return nil, 500, "bad test request"
+				}
+				allowed := func(name string) bool {
+					return sent.ToolChoice != "none" && slices.ContainsFunc(sent.Tools, func(t Tool) bool { return t.Name == name })
+				}
+				search := allowed(tool)
+				if search != (tc.other || n <= searchRounds) || allowed("web_search") != (len(tc.clientTools) > 0 || search && tool == "web_search") {
+					t.Errorf("round %d: tools = %+v, choice = %q", n, sent.Tools, sent.ToolChoice)
+				}
+				wantSystem := system
+				if !tc.other && n > searchRounds {
+					wantSystem += "\n\n" + synthesis
+				}
+				if sent.System != wantSystem {
+					t.Errorf("round %d: system = %q, want %q", n, sent.System, wantSystem)
+				}
+				if n == searchRounds+1 {
+					if len(sent.Messages) != 1+2*searchRounds || sent.Messages[0].Parts[0].Text != user {
+						t.Errorf("synthesis lost the original request or search history: %+v", sent.Messages)
+						return nil, 500, "incomplete synthesis request"
+					}
+					for i := 1; i <= searchRounds; i++ {
+						call, result := sent.Messages[2*i-1].Parts[0], sent.Messages[2*i].Parts[0]
+						if call.Kind != ToolCall || call.Name != tool || call.ID != id(i) ||
+							!strings.Contains(string(call.Args), fmt.Sprintf("Go release %d", i)) ||
+							result.Kind != ToolResult || result.CallID != call.ID || result.IsError ||
+							!strings.Contains(result.Text, "go1.27.1") || !strings.Contains(result.Text, "https://go.dev/dl/") {
+							t.Errorf("synthesis lost search %d: %+v %+v", i, call, result)
+						}
+					}
+				}
+				if n > 1 {
+					last := sent.Messages[len(sent.Messages)-2:]
+					call, result := last[0].Parts[0], last[1].Parts[0]
+					if call.Kind != ToolCall || call.ID != id(n-1) || result.Kind != ToolResult || result.CallID != call.ID {
+						t.Errorf("round %d broke the pending call: %+v", n, last)
+					}
+					if n <= searchRounds+1 && (result.IsError || !strings.Contains(result.Text, "go1.27.1")) || n > searchRounds+1 && !result.IsError {
+						t.Errorf("round %d: unexpected result %+v", n, result)
+					}
+					if n == searchRounds+1 && strings.Contains(result.Text, searchLimitNote) == tc.other {
+						t.Errorf("round %d: unexpected search limit instruction in %q", n, result.Text)
+					}
+				}
+				out := make(chan Event, 4)
+				out <- Event{Kind: KStart, MsgID: id(n)}
+				if n <= searchRounds+tc.staleCalls {
+					out <- Event{Kind: KToolStart, ID: id(n), Name: tool}
+					out <- Event{Kind: KToolArgs, Text: fmt.Sprintf(`{"query":"Go release %d"}`, n)}
+					out <- Event{Kind: KStop, Stop: "tool"}
+				} else if len(tc.clientTools) > 0 {
+					out <- Event{Kind: KToolStart, ID: id(n), Name: tc.clientTools[0].Name}
+					out <- Event{Kind: KToolArgs, Text: `{"query":"client tool input"}`}
+					out <- Event{Kind: KStop, Stop: "tool"}
+				} else {
+					out <- Event{Kind: KText, Text: "Final synthesis from the search results."}
+					out <- Event{Kind: KStop, Stop: "stop"}
+				}
+				close(out)
+				return out, 200, ""
+			}
+			req := &Request{Model: "local-test/neon", System: system, Stream: true, WebSearch: true, Tools: tc.clientTools,
+				Messages: []Message{{Role: "user", Parts: []Part{{Kind: Text, Text: user}}}}}
+			rec := httptest.NewRecorder()
+			New().searchReply(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", nil),
+				provider.Responses, p, req, &Usage{}, ask, true)
+			if rec.Code != 200 || n != searchRounds+1+min(tc.staleCalls, 1) {
+				t.Fatalf("status %d after %d rounds: %s", rec.Code, n, rec.Body)
+			}
+			var completed, failed bool
+			var searches int
+			for _, ev := range events(rec.Body.String()) {
+				switch ev["type"] {
+				case "response.web_search_call.completed":
+					searches++
+				case "response.completed":
+					completed = true
+				case "response.failed":
+					failed = true
+				}
+			}
+			var calls []map[string]any
+			for _, item := range replyItems(t, rec.Body.Bytes(), true) {
+				if item["type"] == "function_call" {
+					calls = append(calls, item)
+				}
+			}
+			if searches != searchRounds || len(calls) != len(tc.clientTools) {
+				t.Fatalf("wanted %d hosted searches and %d client calls: %s", searchRounds, len(tc.clientTools), rec.Body)
+			}
+			if len(calls) > 0 {
+				if !completed || failed || calls[0]["name"] != tc.clientTools[0].Name || calls[0]["call_id"] != id(searchRounds+1) {
+					t.Fatalf("client tool did not pass through: %s", rec.Body)
+				}
+			} else if tc.staleCalls < 2 {
+				if !completed || failed || !strings.Contains(rec.Body.String(), "Final synthesis from the search results.") {
+					t.Fatalf("missing final synthesis: %s", rec.Body)
+				}
+			} else if !failed || completed {
+				t.Fatalf("repeated undeclared call should fail explicitly: %s", rec.Body)
+			}
+		})
+	}
+}
 
 // A client's web search, offered to a model that can't search: the model
 // is given magpie's web_search tool, the search is done by a provider that

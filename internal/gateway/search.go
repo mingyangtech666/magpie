@@ -35,6 +35,8 @@ import (
 // what a search found.
 const searchRounds = 6
 
+const searchLimitNote = "No more searches: answer with what was found."
+
 // searchTimeout is how long a search's vendor has to answer; a model's
 // search (modelSearch) has it from when its request went out, each try's
 // own, and searchWaitMost in all, its waits for a slot or a resting
@@ -1281,14 +1283,11 @@ type round func(ctx context.Context, req *Request) (<-chan Event, int, string)
 // route's every round passes here, whatever protocol the client asked
 // on, and a model that writes its calls out had them reach the client
 // as the text they were (#4562).
-func textCallRound(tools []Tool, ask round) round {
-	names := textCallNames(tools)
-	if names == nil {
-		return ask
-	}
+func textCallRound(ask round) round {
 	return func(ctx context.Context, req *Request) (<-chan Event, int, string) {
+		names := textCallNames(req.Tools)
 		in, status, msg := ask(ctx, req)
-		if in == nil {
+		if in == nil || names == nil {
 			return in, status, msg
 		}
 		out := make(chan Event, 16)
@@ -1321,7 +1320,7 @@ func textCallRound(tools []Tool, ask round) round {
 // advisor_serve.go), and asking it again with what they gave; the client
 // sees one reply. The first round's failure is a status, as another
 // provider may take over.
-func (s *Server) searchReply(w http.ResponseWriter, r *http.Request, from provider.Protocol, name string, req *Request, usage *Usage, ask round, search bool) (int, string) {
+func (s *Server) searchReply(w http.ResponseWriter, r *http.Request, from provider.Protocol, p provider.Provider, req *Request, usage *Usage, ask round, search bool) (int, string) {
 	ctx, cancel := context.WithCancel(withWebAccess(context.WithValue(r.Context(), searchForKey{}, &CallFor{Agent: callerOf(r).agent, Model: unprefixed(req.Model)}), req.WebAccess))
 	defer cancel()
 	q := *req
@@ -1336,7 +1335,7 @@ func (s *Server) searchReply(w http.ResponseWriter, r *http.Request, from provid
 		q.Tools = append(q.Tools, advisorToolDef())
 	}
 	q.Messages = slices.Clone(q.Messages)
-	ask = textCallRound(q.Tools, ask)
+	ask = textCallRound(ask)
 	first, status, msg := ask(ctx, &q)
 	if first == nil {
 		return writeError(w, from, status, msg), msg
@@ -1344,12 +1343,12 @@ func (s *Server) searchReply(w http.ResponseWriter, r *http.Request, from provid
 	events := make(chan Event, 16)
 	go func() {
 		defer close(events)
-		s.searchRounds(ctx, &q, tool.Name, first, ask, events)
+		s.searchRounds(ctx, &q, tool.Name, p.PluginProvider() == "agy-cli", first, ask, events)
 	}()
-	return relay(w, r, from, name, req, events, usage, cancel, nil, func(string, string, bool) {})
+	return relay(w, r, from, p.Name, req, events, usage, cancel, nil, func(string, string, bool) {})
 }
 
-func (s *Server) searchRounds(ctx context.Context, q *Request, tool string, in <-chan Event, ask round, out chan<- Event) {
+func (s *Server) searchRounds(ctx context.Context, q *Request, tool string, agy bool, in <-chan Event, ask round, out chan<- Event) {
 	send := func(ev Event) bool {
 		select {
 		case out <- ev:
@@ -1439,6 +1438,10 @@ func (s *Server) searchRounds(ctx context.Context, q *Request, tool string, in <
 		// a reply that calls the client's tools goes to the client: it
 		// can't answer a search, and doesn't see the ones left out
 		if len(calls) == 0 || theirs || n > searchRounds+1 {
+			if agy && !theirs && n > searchRounds+1 && slices.ContainsFunc(calls, func(c Part) bool { return c.Name == tool }) {
+				send(Event{Kind: KError, Text: "AGY kept calling web search after it was disabled"})
+				return
+			}
 			if stop == "" || (len(calls) > 0 && !theirs) {
 				stop = "stop"
 			}
@@ -1461,7 +1464,7 @@ func (s *Server) searchRounds(ctx context.Context, q *Request, tool string, in <
 				defer wg.Done()
 				results[i] = Part{Kind: ToolResult, CallID: c.ID}
 				if n > searchRounds {
-					results[i].Text, results[i].IsError = "No more searches: answer with what was found.", true
+					results[i].Text, results[i].IsError = searchLimitNote, true
 					return
 				}
 				var a struct {
@@ -1489,6 +1492,24 @@ func (s *Server) searchRounds(ctx context.Context, q *Request, tool string, in <
 		for _, ev := range searches {
 			if (ev.Kind == KSearch || ev.Kind == KAdvice) && !send(ev) {
 				return
+			}
+		}
+		if agy && tool != "" && n == searchRounds {
+			q.Tools = slices.DeleteFunc(q.Tools, func(t Tool) bool { return t.Name == tool })
+			if len(q.Tools) == 0 {
+				q.ToolChoice = "none"
+			} else if q.ToolChoice == "name:"+tool {
+				q.ToolChoice = "auto"
+			}
+			for i, c := range calls {
+				if c.Name == tool {
+					results[i].Text += "\n\n" + searchLimitNote
+					// Changed instructions make AGY close the pending turn and
+					// replay the paired results in a new session. Updating the
+					// live catalog can leave the old prompt planning searches.
+					q.System = withLine(q.System, "Magpie's hosted web search budget is exhausted. Use the search findings already collected to answer the original request and cite the sources you rely on.")
+					break
+				}
 			}
 		}
 		q.Messages = append(q.Messages, Message{Role: "assistant", Parts: res.Parts}, Message{Role: "user", Parts: results})

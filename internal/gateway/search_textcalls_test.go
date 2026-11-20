@@ -168,7 +168,7 @@ func TestTextCallRoundReleasesHeldAtEnd(t *testing.T) {
 		close(in)
 		return in, 200, ""
 	}
-	out, _, _ := textCallRound([]Tool{{Name: "Bash"}}, ask)(t.Context(), &Request{})
+	out, _, _ := textCallRound(ask)(t.Context(), &Request{Tools: []Tool{{Name: "Bash"}}})
 	got := ""
 	for ev := range out {
 		if ev.Kind == KText {

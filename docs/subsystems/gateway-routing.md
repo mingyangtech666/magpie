@@ -1975,6 +1975,23 @@ search is said as before. Covered by `TestSearchCitedAsAnthropics`
 `TestCitesOnlyTheWholeURL`. Responses and Chat replies carry no
 `url_citation` annotations yet.
 
+magpie searches for a model (`searchReply`) in at most `searchRounds` rounds
+of calls. A search asked for after that is answered "No more searches: answer
+with what was found." (`searchLimitNote`), and a reply that still asks ends
+the stream. For `agy-cli`, which plans several searches in one reply and
+hands them to magpie one at a time, that left the turn with calls still
+pending and no text. At the last round `searchRounds` now takes magpie's
+search tool out of the request, adds the note to that round's result and a
+line to the system prompt telling the model to answer from what it found.
+The plugin takes the changed instructions for a new session (`drop_live`,
+reason `instructions`) and replays the history with every call beside its
+result, so the model writes its answer from them. The client's own tools stay
+offered, and a reply that calls one goes to the client as before. A model
+that asks for the search once more is answered with the note; a second ask
+ends the reply with an error. Covered by
+`TestAGYSearchBudgetCompletesPendingRound` in
+[`search_test.go`](../../internal/gateway/search_test.go).
+
 While a provider asked by `searchReply` is queued or thinking, sending only
 keepalives or `response.in_progress`, `askTranslated` reads it with
 `readSSEAlive` and hands on a `KAlive` event after `keepaliveGap` with
